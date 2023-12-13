@@ -22,17 +22,21 @@ import java.net.URL;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Optional;
 import java.util.Properties;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import lombok.SneakyThrows;
+import org.apache.maven.execution.MavenSession;
 import org.apache.maven.plugin.AbstractMojo;
+import org.apache.maven.plugin.MojoExecution;
 import org.apache.maven.plugin.MojoExecutionException;
 import org.apache.maven.plugin.MojoFailureException;
 import org.apache.maven.plugins.annotations.Mojo;
 import org.apache.maven.plugins.annotations.Parameter;
+import org.apache.maven.project.MavenProject;
 import org.r0bb3n.maven.model.Condition;
 import org.r0bb3n.maven.model.ProjectStatus;
 import org.r0bb3n.maven.model.Task;
@@ -57,6 +61,8 @@ public class SonarQualityGateMojo extends AbstractMojo {
 
   private static final String REPORT_TASK_KEY_CE_TASK_ID = "ceTaskId";
 
+  private static final String PROP_SONAR_PROJECT_KEY = "sonar.projectKey";
+
   /**
    * sonar host url<br/> (aligned to sonar-maven-plugin analysis parameters, see also
    * <a href="https://docs.sonarqube.org/latest/analysis/analysis-parameters/">SonarQube - Analysis
@@ -76,10 +82,11 @@ public class SonarQualityGateMojo extends AbstractMojo {
    *
    * @since 1.0.0
    */
-  @Parameter(property = "sonar.projectKey",
+  /*
+  @Parameter(property = PROP_SONAR_PROJECT_KEY,
       defaultValue = "${project.groupId}:${project.artifactId}")
   private String sonarProjectKey;
-
+  */
   /**
    * sonar login (username or token), see also
    * <a href="https://docs.sonarqube.org/latest/extend/web-api/">SonarQube
@@ -173,6 +180,81 @@ public class SonarQualityGateMojo extends AbstractMojo {
    */
   private SonarConnector sonarConnector;
 
+  @Parameter(defaultValue = "${session}", required = true, readonly = true)
+  private MavenSession session;
+
+  @Parameter(defaultValue = "${mojoExecution}", required = true, readonly = true)
+  private MojoExecution mojoExecution;
+
+
+  /**
+   * Should scanner be delayed?
+   * @return true if goal is attached to phase and not last in a multi-module project
+   */
+  private boolean shouldDelayExecution() {
+    return !isDetachedGoal() && !isLastProjectInReactor();
+  }
+
+  /**
+   * Is this execution a 'detached' goal run from the cli.  e.g. mvn sonar:sonar
+   *
+   * See <a href="https://maven.apache.org/guides/mini/guide-default-execution-ids.html#Default_executionIds_for_Implied_Executions">
+   Default executionIds for Implied Executions</a>
+   * for explanation of command line execution id.
+   *
+   * @return true if this execution is from the command line
+   */
+  private boolean isDetachedGoal() {
+    return "default-cli".equals(mojoExecution.getExecutionId());
+  }
+
+  /**
+   * Is this project the last project in the reactor?
+   *
+   * @return true if last project (including only project)
+   */
+  private boolean isLastProjectInReactor() {
+    List<MavenProject> sortedProjects = session.getProjectDependencyGraph().getSortedProjects();
+
+    MavenProject lastProject = sortedProjects.isEmpty()
+        ? session.getCurrentProject()
+        : sortedProjects.get(sortedProjects.size() - 1);
+
+    if (getLog().isDebugEnabled()) {
+      getLog().debug("Current project: '" + session.getCurrentProject().getName() +
+          "', Last project to execute based on dependency graph: '" + lastProject.getName() + "'");
+    }
+
+    return session.getCurrentProject().equals(lastProject);
+  }
+
+  private MavenProject getTopLevelProject() {
+    List<MavenProject> sortedProjects = session.getProjectDependencyGraph().getSortedProjects();
+    return sortedProjects.isEmpty() ? session.getCurrentProject() : sortedProjects.get(0);
+  }
+
+  private String getTopLevelProjectBuildDirectory() {
+    MavenProject topLevelProject = getTopLevelProject();
+    if (getLog().isDebugEnabled()) {
+      getLog().debug("Current project: '" + session.getCurrentProject().getName() +
+          "', topLevelProject: '" + topLevelProject.getName() +
+          "', topLevelProjectBuildDirectory: " + topLevelProject.getBuild().getDirectory() +
+          ", projectBuildDirectory: '" + projectBuildDirectory + "'");
+    }
+
+    return session.getCurrentProject().equals(topLevelProject) ? this.projectBuildDirectory : topLevelProject.getBuild().getDirectory();
+  }
+
+  private String getSonarProjectKey() {
+    String myProjectKey = session.getCurrentProject().getProperties().getProperty(PROP_SONAR_PROJECT_KEY);
+    if (Util.isBlank(myProjectKey)) {
+      MavenProject topLevelProject = getTopLevelProject();
+      myProjectKey = topLevelProject.getGroupId() + ":" + topLevelProject.getArtifact();
+    }
+
+    return myProjectKey;
+  }
+
   /**
    * request project status from sonar and evaluate quality gate result
    *
@@ -185,11 +267,16 @@ public class SonarQualityGateMojo extends AbstractMojo {
       return;
     }
 
+    if (shouldDelayExecution()) {
+      getLog().info("Delaying SonarQualityGate to the end of multi-module project");
+      return;
+    }
+
     setupSonarConnector();
 
     String analysisId;
     if (Util.isBlank(branch) && Util.isBlank(pullRequest)) {
-      Optional<String> ceTaskIdOpt = findCeTaskId(projectBuildDirectory);
+      Optional<String> ceTaskIdOpt = findCeTaskId(this.getTopLevelProjectBuildDirectory());
       analysisId = ceTaskIdOpt
           // previous sonar run found, switching to 'integrated'
           .map(this::retrieveAnalysisId)
@@ -233,27 +320,27 @@ public class SonarQualityGateMojo extends AbstractMojo {
       } else {
         getLog().debug("sonar auth: username + password");
         sonarConnector =
-            new SonarConnector(getLog(), sonarHostUrl, sonarProjectKey, sonarLogin, sonarPassword);
+            new SonarConnector(getLog(), sonarHostUrl, getSonarProjectKey(), sonarLogin, sonarPassword);
       }
     } else {
       // token auth
       if (!Util.isBlank(sonarLogin)) {
         getLog().debug("sonar auth: token (by property '" + PROP_SONAR_LOGIN + "')");
         sonarConnector =
-            new SonarConnector(getLog(), sonarHostUrl, sonarProjectKey, sonarLogin, null);
+            new SonarConnector(getLog(), sonarHostUrl, getSonarProjectKey(), sonarLogin, null);
       } else {
         // check environment variable SONAR_TOKEN as alternative source for the token
         String env = System.getenv(ENV_SONAR_TOKEN);
         if (!Util.isBlank(env)) {
           getLog().debug("sonar auth: token (by environment variable '" + ENV_SONAR_TOKEN + "')");
-          sonarConnector = new SonarConnector(getLog(), sonarHostUrl, sonarProjectKey, env, null);
+          sonarConnector = new SonarConnector(getLog(), sonarHostUrl, getSonarProjectKey(), env, null);
         }
       }
     }
     if (sonarConnector == null) {
       // no auth
       getLog().debug("sonar auth: none");
-      sonarConnector = new SonarConnector(getLog(), sonarHostUrl, sonarProjectKey, null, null);
+      sonarConnector = new SonarConnector(getLog(), sonarHostUrl, getSonarProjectKey(), null, null);
     }
   }
 
